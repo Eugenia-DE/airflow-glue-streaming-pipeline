@@ -3,18 +3,16 @@ from airflow.utils.dates import days_ago
 from airflow.operators.python import PythonOperator
 from airflow.sensors.s3_key_sensor import S3KeySensor
 from airflow.utils.trigger_rule import TriggerRule
-from datetime import datetime, timedelta
 import boto3
+from datetime import datetime
 import pytz
 import time
 import logging
 
-
-# DAG defaults
 DEFAULT_ARGS = {
     "owner": "airflow",
     "retries": 1,
-    "retry_delay": timedelta(minutes=1), 
+    "retry_delay": 60,
 }
 
 REGION = "eu-west-1"
@@ -111,8 +109,7 @@ with DAG(
             "script_args": {
                 "--input_validated_streams_path": f"s3://{S3_BUCKET}/validated",
                 "--output_metrics_base_path": f"s3://{S3_BUCKET}/metrics",
-                "--job_status_output_path": f"s3://{S3_BUCKET}/job-status",
-                "--execution_timestamp": "{{ ti.xcom_pull(task_ids='generate_execution_context', key='execution_timestamp') }}"
+                "--job_status_output_path": f"s3://{S3_BUCKET}/job-status"
             }
         }
     )
