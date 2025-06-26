@@ -1,6 +1,6 @@
 from airflow import DAG
 from airflow.utils.dates import days_ago
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.sensors.s3_key_sensor import S3KeySensor
 from airflow.utils.trigger_rule import TriggerRule
 import boto3
@@ -11,7 +11,7 @@ import logging
 
 DEFAULT_ARGS = {
     "owner": "airflow",
-    "retries": 1,
+    "retries": 2,
     "retry_delay": 60,
 }
 
@@ -53,6 +53,18 @@ def run_glue_job_with_wait(job_name, script_args=None, **kwargs):
     if job_status != 'SUCCEEDED':
         raise Exception(f"Glue job {job_name} failed. Check CloudWatch.")
 
+def check_validated_input(**kwargs):
+    s3 = boto3.client("s3", region_name=REGION)
+    execution_date = kwargs['ti'].xcom_pull(task_ids='generate_execution_context', key='execution_date')
+    prefix = f"validated/processed_date={execution_date}/"
+    response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+
+    if 'Contents' in response and any(obj['Size'] > 0 for obj in response['Contents']):
+        return 'compute_metrics'
+    else:
+        logger.info("No validated input files found.")
+        return 'skip_compute_metrics'
+
 def archive_validated_files(**kwargs):
     execution_date = kwargs['ti'].xcom_pull(task_ids='generate_execution_context', key='execution_date')
     s3 = boto3.resource("s3", region_name=REGION)
@@ -70,7 +82,7 @@ with DAG(
     dag_id="music_pipeline_etl",
     default_args=DEFAULT_ARGS,
     start_date=days_ago(1),
-    schedule_interval=None,
+    schedule_interval="*/15 * * * *",
     catchup=False,
     tags=["music", "glue", "etl"],
 ) as dag:
@@ -82,13 +94,15 @@ with DAG(
 
     wait_for_stream_file = S3KeySensor(
         task_id="wait_for_stream_file",
-        bucket_key="raw/streams/{{ ds }}/streams1.csv",
+        bucket_key="raw/streams/{{ ds }}/*",
         bucket_name=S3_BUCKET,
+        wildcard_match=True,  
         aws_conn_id="aws_default",
         timeout=60 * 30,
         poke_interval=60,
         mode="poke"
     )
+
 
     extract_validate_join = PythonOperator(
         task_id="extract_validate_join_streams",
@@ -99,6 +113,11 @@ with DAG(
                 "--execution_timestamp": "{{ ti.xcom_pull(task_ids='generate_execution_context', key='execution_timestamp') }}"
             }
         }
+    )
+
+    validate_branch = BranchPythonOperator(
+        task_id="check_validated_input",
+        python_callable=check_validated_input
     )
 
     compute_metrics = PythonOperator(
@@ -112,6 +131,11 @@ with DAG(
                 "--job_status_output_path": f"s3://{S3_BUCKET}/job-status"
             }
         }
+    )
+
+    skip_compute = PythonOperator(
+        task_id="skip_compute_metrics",
+        python_callable=lambda: logger.info("Skipping compute_metrics due to no validated input.")
     )
 
     archive_validated = PythonOperator(
@@ -131,7 +155,8 @@ with DAG(
                 "--job_status_output_path": f"s3://{S3_BUCKET}/job-status",
                 "--execution_date": "{{ ti.xcom_pull(task_ids='generate_execution_context', key='execution_date') }}"
             }
-        }
+        },
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
     )
 
     notify_success = PythonOperator(
@@ -154,6 +179,9 @@ with DAG(
         trigger_rule=TriggerRule.ONE_FAILED
     )
 
-    generate_context >> wait_for_stream_file >> extract_validate_join >> compute_metrics >> archive_validated >> load_to_dynamodb
+    # Task Dependencies
+    generate_context >> wait_for_stream_file >> extract_validate_join >> validate_branch
+    validate_branch >> compute_metrics >> archive_validated >> load_to_dynamodb
+    validate_branch >> skip_compute >> load_to_dynamodb
     load_to_dynamodb >> notify_success
     [extract_validate_join, compute_metrics, archive_validated, load_to_dynamodb] >> notify_failure
