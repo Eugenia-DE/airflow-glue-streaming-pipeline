@@ -6,6 +6,7 @@ from awsglue.context import GlueContext
 from awsglue.utils import getResolvedOptions
 from awsglue.dynamicframe import DynamicFrame
 from awsglue.job import Job
+from pyspark.sql.functions import col
 
 args = getResolvedOptions(sys.argv, ['JOB_NAME', 'execution_timestamp'])
 
@@ -43,6 +44,11 @@ try:
     check_required_columns(users_df, {'user_id', 'user_name', 'user_age', 'user_country', 'created_at'}, "users")
     check_required_columns(songs_df, {'track_id', 'track_name', 'track_genre', 'duration_ms'}, "songs")
     check_required_columns(streams_df, {'user_id', 'track_id', 'listen_time'}, "streams")
+
+    # Deduplication
+    users_df = users_df.dropDuplicates(["user_id"])
+    songs_df = songs_df.dropDuplicates(["track_id"])
+    streams_df = streams_df.dropDuplicates(["user_id", "track_id", "listen_time"])
 
     bad_users = users_df.filter("user_id IS NULL OR user_name IS NULL OR user_age IS NULL")
     bad_songs = songs_df.filter("track_id IS NULL OR track_genre IS NULL OR duration_ms IS NULL")
